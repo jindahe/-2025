@@ -1,4 +1,3 @@
-#!/bin/env python3
 import math
 from itertools import combinations
 import matplotlib.pyplot as plt
