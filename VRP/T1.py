@@ -118,9 +118,9 @@ def plot_routes(points, routes):
                  linestyle='-', linewidth=2, 
                  label=f'UAV {i+1}: {route["distance"]:.1f}m')
     
-    plt.xlabel('X Coordinate (m)')
-    plt.ylabel('Y Coordinate (m)')
-    plt.title('UAV Path Planning with VRP Algorithm')
+    plt.xlabel('X (m)')
+    plt.ylabel('Y (m)')
+    plt.title('UAV Path Planning ')
     plt.legend()
     plt.grid(True)
     plt.show()

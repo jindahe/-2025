@@ -3,302 +3,310 @@ import heapq
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 
-# 定义坐标点和障碍物
-points = {
-    'depot': (0, 0),
+class DronePathPlanner:
+    def __init__(self, drones, targets, obstacles=None):
+        self.drones = drones  # 无人机初始位置和状态
+        self.targets = targets  # 目标点字典 {名称: (x,y)}
+        self.obstacles = obstacles if obstacles else []  # 障碍物列表 [(x,y,radius)]
+        
+        # 记录路径和分配方案
+        self.paths = {drone_id: [pos] for drone_id, pos in drones.items()}
+        self.allocations = {drone_id: [] for drone_id in drones}
+        
+    def euclidean_distance(self, a, b):
+        return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
+    
+    def a_star(self, start, goal, drone_id, current_time):
+        """A*算法实现避障路径规划"""
+        def heuristic(pos):
+            return self.euclidean_distance(pos, goal)
+        
+        # 定义网格大小和分辨率
+        grid_size = 2000  # 整个区域大小
+        resolution = 50   # 网格分辨率
+        
+        open_set = []
+        heapq.heappush(open_set, (0 + heuristic(start), 0, start, [start]))
+        closed_set = set()
+        
+        while open_set:
+            _, g, current, path = heapq.heappop(open_set)
+            
+            if current in closed_set:
+                continue
+                
+            closed_set.add(current)
+            
+            # 检查是否到达目标
+            if self.euclidean_distance(current, goal) < resolution:
+                return path + [goal]
+            
+            # 生成邻近节点
+            for dx in [-resolution, 0, resolution]:
+                for dy in [-resolution, 0, resolution]:
+                    if dx == 0 and dy == 0:
+                        continue
+                        
+                    neighbor = (current[0] + dx, current[1] + dy)
+                    
+                    # 检查边界
+                    if not (0 <= neighbor[0] <= grid_size and 0 <= neighbor[1] <= grid_size):
+                        continue
+                    
+                    # 检查障碍物碰撞
+                    collision = False
+                    for (ox, oy, radius) in self.obstacles:
+                        if self.euclidean_distance(neighbor, (ox, oy)) < radius + 50:  # 50m安全距离
+                            collision = True
+                            break
+                    if collision:
+                        continue
+                    
+                    # 检查与其他无人机的安全距离
+                    safe = True
+                    for other_drone, other_pos in self.drones.items():
+                        if other_drone != drone_id:
+                            dist = self.euclidean_distance(neighbor, other_pos)
+                            if dist < 50:  # 最小间距约束
+                                safe = False
+                                break
+                    if not safe:
+                        continue
+                    
+                    new_g = g + self.euclidean_distance(current, neighbor)
+                    heapq.heappush(open_set, (new_g + heuristic(neighbor), new_g, neighbor, path + [neighbor]))
+        
+        return None  # 没有找到路径
+    
+    def assign_targets(self):
+        """初始目标分配（简单最近邻方法）"""
+        unassigned = set(self.targets.keys())
+        
+        while unassigned:
+            for drone_id, pos in self.drones.items():
+                if not unassigned:
+                    break
+                
+                # 找到最近未分配目标
+                nearest = min(unassigned, key=lambda t: self.euclidean_distance(pos, self.targets[t]))
+                self.allocations[drone_id].append(nearest)
+                unassigned.remove(nearest)
+                
+                # 更新无人机位置到目标点
+                self.drones[drone_id] = self.targets[nearest]
+                self.paths[drone_id].append(self.targets[nearest])
+    
+    def dynamic_replan(self, new_target, new_obstacle, current_time):
+        """动态重规划处理新目标和障碍"""
+        # 添加新障碍
+        self.obstacles.append(new_obstacle)
+        
+        # 添加新目标
+        new_target_name = f"T{len(self.targets)+1}"
+        self.targets[new_target_name] = new_target
+        
+        # 找到最适合处理新目标的无人机（最近且满足约束）
+        best_drone = None
+        min_dist = float('inf')
+        
+        for drone_id, pos in self.drones.items():
+            dist = self.euclidean_distance(pos, new_target)
+            if dist < min_dist:
+                # 检查路径是否可行
+                path = self.a_star(pos, new_target, drone_id, current_time)
+                if path:
+                    min_dist = dist
+                    best_drone = drone_id
+                    best_path = path
+        
+        if best_drone:
+            # 分配新目标给最佳无人机
+            self.allocations[best_drone].append(new_target_name)
+            
+            # 更新路径
+            self.paths[best_drone].extend(best_path[1:])  # 跳过第一个点（当前位置）
+            self.drones[best_drone] = new_target
+            
+            # 重新规划该无人机的返航路径（如果需要）
+            return_path = self.a_star(new_target, (0,0), best_drone, current_time)
+            if return_path:
+                self.paths[best_drone].extend(return_path[1:])
+        
+        # 对其他无人机检查是否需要避障
+        for drone_id, pos in self.drones.items():
+            if drone_id == best_drone:
+                continue
+                
+            current_path = self.paths[drone_id]
+            if len(current_path) > 1:
+                next_point = current_path[-1]  # 假设无人机正在前往的下一个点
+                
+                # 检查路径是否穿过障碍
+                needs_replan = False
+                for (ox, oy, radius) in self.obstacles:
+                    # 简单线段与圆相交检测
+                    if self.line_circle_intersection(pos, next_point, (ox, oy), radius):
+                        needs_replan = True
+                        break
+                
+                if needs_replan:
+                    new_path = self.a_star(pos, next_point, drone_id, current_time)
+                    if new_path:
+                        self.paths[drone_id] = current_path[:-1] + new_path[1:]
+    
+    def line_circle_intersection(self, p1, p2, center, radius):
+        """检查线段是否与圆相交"""
+        # 线段参数方程: p = p1 + t*(p2-p1), t∈[0,1]
+        # 圆心到线段的距离
+        x1, y1 = p1
+        x2, y2 = p2
+        cx, cy = center
+        
+        # 向量化计算
+        dx = x2 - x1
+        dy = y2 - y1
+        l2 = dx*dx + dy*dy
+        
+        # 线段是点的情况
+        if l2 == 0:
+            return self.euclidean_distance(p1, center) <= radius
+        
+        # 计算投影参数t
+        t = ((cx - x1) * dx + (cy - y1) * dy) / l2
+        t = max(0, min(1, t))
+        
+        # 投影点
+        projection = (x1 + t * dx, y1 + t * dy)
+        
+        # 检查距离
+        return self.euclidean_distance(projection, center) <= radius
+    
+    def visualize(self):
+        """可视化结果，风格与T1一致"""
+        plt.figure(figsize=(10, 8))
+        # 绘制所有点
+        for name, coord in self.targets.items():
+            if name == 'T1':  # 只为第一个目标点加label，防止重复
+                plt.plot(coord[0], coord[1], 'bo', markersize=8, label=name)
+            else:
+                plt.plot(coord[0], coord[1], 'bo', markersize=8)
+            plt.text(coord[0]+20, coord[1]+20, name, fontsize=12)
+        plt.plot(0, 0, 'ro', markersize=10, label='Depot')
+        # 绘制障碍物
+        for (x, y, r) in self.obstacles:
+            circle = Circle((x, y), r, color='gray', alpha=0.5)
+            plt.gca().add_patch(circle)
+        # 绘制无人机路径
+        colors = ['g', 'm', 'c', 'y', 'k']
+        for i, (drone_id, path) in enumerate(self.paths.items()):
+            if len(path) > 1:
+                x_coords = [p[0] for p in path]
+                y_coords = [p[1] for p in path]
+                plt.plot(x_coords, y_coords, colors[i % len(colors)], linestyle='-', linewidth=2, label=f'UAV {i+1}: {sum(self.euclidean_distance(path[j], path[j+1]) for j in range(len(path)-1)):.1f}m')
+        plt.xlabel('X (m)')
+        plt.ylabel('Y (m)')
+        plt.title('UAV Path Planning ')
+        plt.legend()
+        plt.grid(True)
+        plt.axis('equal')
+        plt.show()
+    
+    def animate(self, interval=500):
+        """动态展示无人机路径规划过程（与T1风格一致）"""
+        import matplotlib.animation as animation
+        fig, ax = plt.subplots(figsize=(10, 8))
+        # 绘制所有点
+        for name, coord in self.targets.items():
+            if name == 'T1':
+                ax.plot(coord[0], coord[1], 'bo', markersize=8, label=name)
+            else:
+                ax.plot(coord[0], coord[1], 'bo', markersize=8)
+            ax.text(coord[0]+20, coord[1]+20, name, fontsize=12)
+        ax.plot(0, 0, 'ro', markersize=10, label='Depot')
+        # 绘制障碍物
+        for (x, y, r) in self.obstacles:
+            circle = Circle((x, y), r, color='gray', alpha=0.5)
+            ax.add_patch(circle)
+        colors = ['g', 'm', 'c', 'y', 'k']
+        max_len = max(len(path) for path in self.paths.values())
+        lines = []
+        points = []
+        for i, (drone_id, path) in enumerate(self.paths.items()):
+            line, = ax.plot([], [], colors[i % len(colors)], linestyle='-', linewidth=2, label=f'UAV {i+1}')
+            point, = ax.plot([], [], marker='o', color=colors[i % len(colors)], markersize=10)
+            lines.append(line)
+            points.append(point)
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_title('UAV Path Planning (Animation)')
+        ax.legend()
+        ax.grid(True)
+        ax.axis('equal')
+        def update(frame):
+            for i, (drone_id, path) in enumerate(self.paths.items()):
+                if frame < len(path):
+                    x = [p[0] for p in path[:frame+1]]
+                    y = [p[1] for p in path[:frame+1]]
+                    lines[i].set_data(x, y)
+                    points[i].set_data([x[-1]], [y[-1]])  # 修正：必须传序列
+                else:
+                    x = [p[0] for p in path]
+                    y = [p[1] for p in path]
+                    lines[i].set_data(x, y)
+                    points[i].set_data([x[-1]], [y[-1]])  # 修正：必须传序列
+            return lines + points
+        ani = animation.FuncAnimation(fig, update, frames=max_len, interval=interval, blit=True, repeat=False)
+        plt.show()
+
+# 问题2的实例数据
+initial_drones = {
+    'U1': (0, 0),
+    'U2': (0, 0),
+    'U3': (0, 0)
+}
+
+targets = {
     'T1': (1200, 800),
     'T2': (300, 450),
     'T3': (950, 200),
     'T4': (600, 1200),
-    'T5': (1500, 500),
-    'T6': (800, 600)  # 新增目标点
+    'T5': (1500, 500)
 }
 
-obstacle = {
-    'center': (900, 250),
-    'radius': 100,
-    'appear_time': 100  # 在100秒时出现
-}
+# 创建路径规划器
+planner = DronePathPlanner(initial_drones, targets)
 
-# 无人机速度 (m/s)
-uav_speed = 50
+# 初始目标分配
+planner.assign_targets()
 
-# 计算两点之间的欧几里得距离
-def calculate_distance(p1, p2):
-    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+# 模拟在100s时新增障碍和紧急目标
+new_obstacle = (900, 250, 100)  # (x, y, radius)
+new_target = (800, 600)
+current_time = 100  # 假设在100s时发生动态变化
 
-# 检查线段是否与圆形障碍物相交
-def line_intersects_circle(p1, p2, circle_center, circle_radius):
-    # 将线段表示为向量
-    d = (p2[0]-p1[0], p2[1]-p1[1])
-    f = (p1[0]-circle_center[0], p1[1]-circle_center[1])
-    
-    a = d[0]**2 + d[1]**2
-    b = 2 * (f[0]*d[0] + f[1]*d[1])
-    c = (f[0]**2 + f[1]**2) - circle_radius**2
-    
-    discriminant = b**2 - 4*a*c
-    
-    if discriminant < 0:
-        return False  # 无交点
-    
-    discriminant = math.sqrt(discriminant)
-    t1 = (-b - discriminant) / (2*a)
-    t2 = (-b + discriminant) / (2*a)
-    
-    # 检查交点是否在线段上
-    if 0 <= t1 <= 1 or 0 <= t2 <= 1:
-        return True
-    
-    return False
+# 动态重规划
+planner.dynamic_replan(new_target, new_obstacle, current_time)
 
-# A*路径规划算法
-def a_star_pathfinding(start, end, obstacle_center, obstacle_radius):
-    # 定义网格大小
-    grid_size = 50  # 米
-    
-    # 计算网格坐标
-    def get_grid_coord(point):
-        return (int(point[0]/grid_size), int(point[1]/grid_size))
-    
-    start_grid = get_grid_coord(start)
-    end_grid = get_grid_coord(end)
-    
-    # 启发式函数 (曼哈顿距离)
-    def heuristic(a, b):
-        return abs(a[0]-b[0]) + abs(a[1]-b[1])
-    
-    # 邻居方向 (8个方向)
-    neighbors = [(0,1),(1,0),(0,-1),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]
-    
-    open_set = []
-    heapq.heappush(open_set, (0, start_grid))
-    
-    came_from = {}
-    g_score = {start_grid: 0}
-    f_score = {start_grid: heuristic(start_grid, end_grid)}
-    
-    open_set_hash = {start_grid}
-    
-    while open_set:
-        current = heapq.heappop(open_set)[1]
-        open_set_hash.remove(current)
-        
-        if current == end_grid:
-            # 重建路径
-            path = []
-            while current in came_from:
-                path.append((current[0]*grid_size, current[1]*grid_size))
-                current = came_from[current]
-            path.append(start)
-            path.reverse()
-            path.append(end)
-            return path
-        
-        for dx, dy in neighbors:
-            neighbor = (current[0]+dx, current[1]+dy)
-            
-            # 转换为实际坐标
-            neighbor_pos = (neighbor[0]*grid_size, neighbor[1]*grid_size)
-            
-            # 检查是否在障碍物内
-            if calculate_distance(neighbor_pos, obstacle_center) <= obstacle_radius:
-                continue
-            
-            # 计算临时g分数
-            temp_g_score = g_score[current] + calculate_distance(
-                (current[0]*grid_size, current[1]*grid_size),
-                neighbor_pos
-            )
-            
-            if neighbor not in g_score or temp_g_score < g_score[neighbor]:
-                came_from[neighbor] = current
-                g_score[neighbor] = temp_g_score
-                f_score[neighbor] = temp_g_score + heuristic(neighbor, end_grid)
-                if neighbor not in open_set_hash:
-                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
-                    open_set_hash.add(neighbor)
-    
-    return None  # 没有找到路径
+# 输出结果
+print("调整后的路径规划:")
+for drone_id, path in planner.paths.items():
+    print(f"{drone_id}路径:", " → ".join([f"({x},{y})" for x, y in path]))
+    print(f"总飞行距离: {sum(planner.euclidean_distance(path[i], path[i+1]) for i in range(len(path)-1)):.1f}m")
+    print(f"分配的目标点: {planner.allocations[drone_id]}")
+    print()
 
-# 调整路径以避开障碍物
-def adjust_path_for_obstacle(original_path, obstacle_center, obstacle_radius):
-    adjusted_path = [original_path[0]]
-    
-    for i in range(len(original_path)-1):
-        p1 = points[original_path[i]]
-        p2 = points[original_path[i+1]]
-        
-        if line_intersects_circle(p1, p2, obstacle_center, obstacle_radius):
-            # 需要避障
-            new_segment = a_star_pathfinding(p1, p2, obstacle_center, obstacle_radius)
-            if new_segment:
-                # 将新路径段转换为目标点名称
-                for point in new_segment[1:-1]:  # 跳过起点和终点(已经在路径中)
-                    adjusted_path.append(f"WP{point[0]}_{point[1]}")  # 添加航路点
-            else:
-                print(f"Warning: Could not find path between {original_path[i]} and {original_path[i+1]}")
-        adjusted_path.append(original_path[i+1])
-    
-    return adjusted_path
+# 计算最短完成时间
+flight_times = []
+for drone_id, path in planner.paths.items():
+    distance = sum(planner.euclidean_distance(path[i], path[i+1]) for i in range(len(path)-1))
+    time = distance / 50  # 假设最大速度50m/s
+    flight_times.append(time)
 
-# 计算路径总距离
-def calculate_path_distance(path):
-    distance = 0
-    for i in range(len(path)-1):
-        p1 = path[i] if isinstance(path[i], tuple) else points[path[i]]
-        p2 = path[i+1] if isinstance(path[i+1], tuple) else points[path[i+1]]
-        distance += calculate_distance(p1, p2)
-    return distance
+shortest_time = max(flight_times)
+print(f"T1-T6全覆盖的最短时间: {shortest_time:.1f}s")
 
-# 计算到达各点的时间
-def calculate_arrival_times(path, start_time=0):
-    current_time = start_time
-    arrival_times = {}
-    positions = []
-    
-    for i in range(len(path)-1):
-        p1 = path[i] if isinstance(path[i], tuple) else points[path[i]]
-        p2 = path[i+1] if isinstance(path[i+1], tuple) else points[path[i+1]]
-        
-        distance = calculate_distance(p1, p2)
-        travel_time = distance / uav_speed
-        
-        if isinstance(path[i+1], str) and path[i+1].startswith('T'):
-            arrival_times[path[i+1]] = current_time + travel_time
-        
-        positions.append((p1, current_time))
-        current_time += travel_time
-    
-    positions.append((points[path[-1]], current_time))
-    return arrival_times, positions, current_time
+# 可视化
+planner.visualize()
 
-# 主程序
-if __name__ == "__main__":
-    # 初始路径分配 (基于问题1的解决方案)
-    original_routes = [
-        ['depot', 'T1', 'T5', 'depot'],
-        ['depot', 'T2', 'T3', 'depot'],
-        ['depot', 'T4', 'depot']
-    ]
-    
-    # 调整路径以避开障碍物
-    adjusted_routes = []
-    for route in original_routes:
-        adjusted_route = adjust_path_for_obstacle(route, obstacle['center'], obstacle['radius'])
-        adjusted_routes.append(adjusted_route)
-    
-    # 分配新增目标点T6给飞行时间最短的无人机
-    # 计算各无人机完成初始任务的时间
-    completion_times = []
-    for route in adjusted_routes:
-        _, _, time = calculate_arrival_times(route)
-        completion_times.append(time)
-    
-    # 选择最早完成的无人机来服务T6
-    selected_uav = completion_times.index(min(completion_times))
-    
-    # 将T6插入到选中的无人机路径中
-    # 找到最佳插入位置 (使总距离增加最少)
-    best_position = 1  # 默认插入在第一个目标点之后
-    min_increase = float('inf')
-    target_route = adjusted_routes[selected_uav]
-    
-    for i in range(1, len(target_route)):
-        # 计算在位置i插入T6的距离增加量
-        original_dist = calculate_distance(
-            points[target_route[i-1]], 
-            points[target_route[i]]
-        )
-        new_dist = (
-            calculate_distance(points[target_route[i-1]], points['T6']) +
-            calculate_distance(points['T6'], points[target_route[i]])
-        )
-        increase = new_dist - original_dist
-        
-        if increase < min_increase:
-            min_increase = increase
-            best_position = i
-    
-    # 插入T6
-    adjusted_routes[selected_uav].insert(best_position, 'T6')
-    
-    # 重新计算调整后的路径
-    final_routes = []
-    for route in adjusted_routes:
-        # 确保路径以depot开始和结束
-        if route[0] != 'depot':
-            route.insert(0, 'depot')
-        if route[-1] != 'depot':
-            route.append('depot')
-        
-        # 展开航路点
-        expanded_route = []
-        for point in route:
-            if point.startswith('WP'):
-                coords = point[2:].split('_')
-                expanded_route.append((float(coords[0]), float(coords[1])))
-            else:
-                expanded_route.append(point)
-        final_routes.append(expanded_route)
-    
-    # 计算各无人机的时间分配
-    print("Adjusted UAV Paths with Obstacle Avoidance:")
-    max_completion_time = 0
-    for i, route in enumerate(final_routes):
-        arrival_times, positions, total_time = calculate_arrival_times(route)
-        
-        print(f"\nUAV {i+1}:")
-        print(f"Path: {' → '.join([p if isinstance(p, str) else f'WP({p[0]},{p[1]})' for p in route])}")
-        print(f"Total distance: {calculate_path_distance(route):.1f} meters")
-        print(f"Total time: {total_time:.1f} seconds")
-        
-        # 打印目标点到达时间
-        for target, time in arrival_times.items():
-            print(f"  Arrives at {target} at {time:.1f}s")
-        
-        max_completion_time = max(max_completion_time, total_time)
-    
-    print(f"\nTime to complete all targets: {max_completion_time:.1f} seconds")
-    
-    # 可视化结果
-    plt.figure(figsize=(12, 10))
-    
-    # 绘制所有点
-    for name, coord in points.items():
-        if name == 'depot':
-            plt.plot(coord[0], coord[1], 'ro', markersize=10, label='Depot')
-        else:
-            plt.plot(coord[0], coord[1], 'bo', markersize=8, label=name)
-            plt.text(coord[0]+20, coord[1]+20, name, fontsize=12)
-    
-    # 绘制障碍物
-    obstacle_circle = Circle(
-        obstacle['center'], obstacle['radius'],
-        color='r', alpha=0.3, label='Obstacle (appears at 100s)'
-    )
-    plt.gca().add_patch(obstacle_circle)
-    
-    # 绘制路线
-    colors = ['g', 'm', 'c', 'y', 'k']
-    for i, route in enumerate(final_routes):
-        x_coords = []
-        y_coords = []
-        for point in route:
-            if isinstance(point, tuple):
-                x_coords.append(point[0])
-                y_coords.append(point[1])
-            else:
-                x_coords.append(points[point][0])
-                y_coords.append(points[point][1])
-        
-        plt.plot(x_coords, y_coords, colors[i % len(colors)], 
-                 linestyle='-', linewidth=2, 
-                 label=f'UAV {i+1} Path')
-    
-    plt.xlabel('X Coordinate (m)')
-    plt.ylabel('Y Coordinate (m)')
-    plt.title('UAV Path Planning with Obstacle Avoidance')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+# 动态可视化
+planner.animate(interval=500)
