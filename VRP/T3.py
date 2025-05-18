@@ -101,43 +101,68 @@ def generate_tasks():
     return tasks
 
 def assign_tasks(drones, tasks):
-    """任务分配主算法"""
+    """任务分配主算法，严格按照T3.md的分层贪心思想"""
     # 按优先级分组
     priority_groups = defaultdict(list)
     for task in tasks:
         priority_groups[task.priority].append(task)
-    
-    # 按优先级从高到低处理
-    for priority in sorted(priority_groups.keys()):
-        current_tasks = priority_groups[priority]
-        
-        # 特殊处理紧急任务（优先级1）
-        if priority == 1:
-            # 每个无人机分配一个紧急任务
-            for i, task in enumerate(current_tasks):
-                if i < len(drones):
-                    drones[i].assign_task(task)
-                    task.assigned = True
-        
-        # 处理其他优先级任务
-        else:
-            for task in current_tasks:
-                # 找到最适合的无人机（剩余续航最多/负载最轻）
-                best_drone = None
-                best_metric = -float('inf')
-                
-                for drone in drones:
-                    if drone.can_assign(task):
-                        # 评估指标：剩余续航/当前负载（越大越好）
-                        metric = drone.remaining_endurance / (drone.current_load + 1)
-                        if metric > best_metric:
-                            best_metric = metric
-                            best_drone = drone
-                
-                if best_drone:
-                    best_drone.assign_task(task)
-                    task.assigned = True
-    
+    # 优先级1：每个无人机分配一个紧急任务
+    urgent_tasks = priority_groups.get(1, [])
+    for i, task in enumerate(urgent_tasks):
+        if i < len(drones):
+            drones[i].assign_task(task)
+            task.assigned = True
+    # 优先级2：普通投放，分三类，遍历所有分配方案，选最短完成时间
+    normal_tasks = priority_groups.get(2, [])
+    from itertools import permutations
+    best_perm = None
+    best_time = float('inf')
+    if len(normal_tasks) == len(drones):
+        for perm in permutations(normal_tasks):
+            # 复制无人机状态
+            drones_copy = [Drone(d.name, d.max_load, d.max_endurance, d.hover_time) for d in drones]
+            for i, task in enumerate(perm):
+                drones_copy[i].position = drones[i].position
+                drones_copy[i].remaining_endurance = drones[i].remaining_endurance
+                drones_copy[i].current_load = drones[i].current_load
+                drones_copy[i].mission_log = list(drones[i].mission_log)
+                drones_copy[i].total_distance = drones[i].total_distance
+                drones_copy[i].assign_task(task)
+            finish_time = max(d.current_time() for d in drones_copy)
+            if finish_time < best_time:
+                best_time = finish_time
+                best_perm = perm
+        # 按最佳分配方案分配
+        for i, task in enumerate(best_perm):
+            drones[i].assign_task(task)
+            task.assigned = True
+    else:
+        # 普通贪心分配
+        for task in normal_tasks:
+            best_drone = min(drones, key=lambda d: d.current_time())
+            best_drone.assign_task(task)
+            task.assigned = True
+    # 优先级3：侦察任务，遍历所有无人机，分配给完成普通任务后最早空闲的无人机
+    scout_tasks = priority_groups.get(3, [])
+    for task in scout_tasks:
+        best_drone = None
+        best_time = float('inf')
+        for drone in drones:
+            # 计算该无人机完成普通任务后到侦察点的时间
+            temp_drone = Drone(drone.name, drone.max_load, drone.max_endurance, drone.hover_time)
+            temp_drone.position = drone.position
+            temp_drone.remaining_endurance = drone.remaining_endurance
+            temp_drone.current_load = drone.current_load
+            temp_drone.mission_log = list(drone.mission_log)
+            temp_drone.total_distance = drone.total_distance
+            temp_drone.assign_task(task)
+            finish_time = temp_drone.current_time()
+            if finish_time < best_time:
+                best_time = finish_time
+                best_drone = drone
+        if best_drone:
+            best_drone.assign_task(task)
+            task.assigned = True
     # 处理未分配的任务（可能由于约束无法分配）
     unassigned = [t for t in tasks if not t.assigned]
     if unassigned:
